@@ -11,3 +11,15 @@
 __pycache__/
 .venv/
 .ruff_cache/
+*.mp4
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.heic
+*.heif
+*.heic
+*.heif
+*.heic
+*.heif

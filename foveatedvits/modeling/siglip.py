@@ -194,7 +194,8 @@ class _Module(nn.Module):
     depth: int = 12
     mlp_dim: int | None = None  # Defaults to 4x input dim
     num_heads: int = 12
-    posemb: str = "learn"  # Can also be "sincos2d"
+    # posemb: str = "learn"  # Can also be "sincos2d"
+    posemb: str = "sincos2d"  
     rep_size: int | bool = False
     dropout: float = 0.0
     pool_type: str = "gap"  # Can also be "map" or "tok"
