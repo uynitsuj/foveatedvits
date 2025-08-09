@@ -23,6 +23,78 @@ import numpy as np
 
 import foveatedvits.utils.jax_sharding as sharding
 
+def rope_angles_2d(u, v, dim, base=10000.0):
+    """
+    Build interleaved 2D RoPE angles from (u, v) of shape [n, L] or [1, L].
+    Returns cos, sin shaped [n, L, dim], where dim is even.
+    The first half of pairs uses u, the second half uses v (x/y interleave).
+    """
+    assert dim % 2 == 0, "Head dim must be even for RoPE."
+    half = dim // 2
+    pair = half  # number of 2D pairs across x and y together
+    freqs = jnp.arange(half // 2) / (half // 2 - 1 + 1e-9)
+    inv_freq = 1.0 / (base ** freqs)                                  # [half//2]
+
+    # Build angles for u (x) and v (y)
+    def _angles(coord):
+        # coord: [n, L]
+        ang = jnp.einsum("nl,f->nlf", coord, inv_freq)                 # [n, L, half//2]
+        sin = jnp.sin(ang); cos = jnp.cos(ang)
+        # interleave into [n, L, half] as (cos, sin) pairs per 2 dims
+        return jnp.stack([cos, sin], axis=-1).reshape(coord.shape[0], coord.shape[1], -1)  # [n,L,half]
+
+    cos_x_sin_x = _angles(u)  # [n,L,half]
+    cos_y_sin_y = _angles(v)  # [n,L,half]
+    # Interleave x,y across the final dim: (x0,y0,x1,y1,...) each carrying (cos,sin) pairs implicitly
+    cos = jnp.concatenate([cos_x_sin_x, cos_y_sin_y], axis=-1)  # [n,L,dim]
+    sin = jnp.concatenate([cos_x_sin_x[..., ::2]*0 + cos_x_sin_x[..., 1:2]*0 + 0,  # just to match shape below
+                           cos_y_sin_y], axis=-1)  # placeholder; we'll compute sin via a helper below
+    # We'll actually not use this sin; rotation uses paired dims directly (see apply below).
+    return cos, None  # sin isn't needed with the pairwise formula below
+
+
+def rope_apply(q_or_k, u, v, base=10000.0):
+    """
+    Apply 2D RoPE in-place to a projected tensor shaped [n, L, num_heads, head_dim].
+    We rotate every 2 dims as a complex pair; x- and y-based phases are interleaved.
+    """
+    n, L, H, D = q_or_k.shape
+    assert D % 2 == 0
+    # Build phases per head dim
+    # For stability/throughput, compute inv_freq once and broadcast
+    half = D // 2
+    freqs = jnp.arange(half // 2) / (half // 2 - 1 + 1e-9)
+    inv_freq = 1.0 / (base ** freqs)  # [half//2]
+
+    # Angles for x and y: [n,L,half//2]
+    ang_x = jnp.einsum("nl,f->nlf", u, inv_freq)
+    ang_y = jnp.einsum("nl,f->nlf", v, inv_freq)
+
+    # Expand to [n,L,1,half//2] then to pairs
+    ang_x = ang_x[:, :, None, :]
+    ang_y = ang_y[:, :, None, :]
+
+    # Reshape q/k to pairs along head_dim
+    q = q_or_k.reshape(n, L, H, D // 2, 2)  # [..., pair, 2]
+    # Split the pair axis into two halves: first half gets x-phase, second half gets y-phase
+    pair_half = q.shape[-2] // 2
+    qx, qy = jnp.split(q, [pair_half], axis=-2)  # each [..., pair_half, 2]
+
+    def rotate(qpair, ang):
+        # qpair: [n,L,H,P,2], ang: [n,L,1,P]
+        c = jnp.cos(ang)
+        s = jnp.sin(ang)
+        x = qpair[..., 0]
+        y = qpair[..., 1]
+        xr = x * c - y * s
+        yr = x * s + y * c
+        return jnp.stack([xr, yr], axis=-1)
+
+    qx = rotate(qx, ang_x)
+    qy = rotate(qy, ang_y)
+    q_rot = jnp.concatenate([qx, qy], axis=-2).reshape(n, L, H, D)
+    return q_rot
+
 
 def posemb_sincos_2d(h, w, width, temperature=10_000.0, dtype=jnp.float32):
     """Follows the MoCo v3 logic."""
@@ -71,6 +143,57 @@ class MlpBlock(nn.Module):
         x = nn.Dropout(rate=self.dropout)(x, deterministic)
         return nn.Dense(d, dtype=self.dtype_mm, **inits)(x)
 
+class RotaryMultiHeadDotProductAttention(nn.Module):
+    num_heads: int
+    dtype: str = "float32"
+    kernel_init: nn.initializers.Initializer = nn.initializers.xavier_uniform()
+    deterministic: bool = True
+
+    @nn.compact
+    def __call__(self, inputs_q, inputs_kv, rope_uv=None):
+        # inputs_*: [n,L,d_model]
+        d_model = inputs_q.shape[-1]
+        head_dim = d_model // self.num_heads
+        assert (d_model % self.num_heads) == 0, "d_model must be divisible by num_heads."
+        dense = lambda: nn.DenseGeneral(  # noqa: E731
+            features=(self.num_heads, head_dim),
+            axis=-1,
+            dtype=self.dtype,
+            kernel_init=self.kernel_init,
+            bias_init=nn.initializers.zeros,
+        )
+        q = dense()(inputs_q)   # [n,L,H,Dh]
+        k = dense()(inputs_kv)  # [n,L,H,Dh]
+        v = dense()(inputs_kv)  # [n,L,H,Dh]
+
+        # RoPE: u,v are [n,L]; if None, build a regular grid
+        if rope_uv is None:
+            n, L = q.shape[0], q.shape[1]
+            # default grid in [0,1): approximate u=x/s, v=y/s with s ~ patch size -> use normalized (x,y)
+            # Build an 1D index and pretend it came from an h×w grid
+            h = w = int(jnp.sqrt(L))
+            assert h * w == L, "Provide rope_uv for non-square / multi-tier sequences."
+            ys, xs = jnp.mgrid[:h, :w]
+            xs = (xs.reshape(-1) + 0.5) / w
+            ys = (ys.reshape(-1) + 0.5) / h
+            u = jnp.tile(xs[None, :], [n, 1])
+            v = jnp.tile(ys[None, :], [n, 1])
+        else:
+            u, v = rope_uv  # each [n,L]
+
+        q = rope_apply(q, u, v)
+        k = rope_apply(k, u, v)
+
+        # scaled dot-product attn
+        scale = 1.0 / jnp.sqrt(head_dim).astype(q.dtype)
+        attn_logits = jnp.einsum("nqhd,nkhd->nhqk", q, k) * scale
+        attn = nn.softmax(attn_logits, axis=-1)
+        out = jnp.einsum("nhqk,nkhd->nqhd", attn, v)
+        out = nn.DenseGeneral(
+            features=d_model, axis=(-2, -1), dtype=self.dtype, kernel_init=self.kernel_init
+        )(out)
+        return out
+
 
 class Encoder1DBlock(nn.Module):
     """Single transformer encoder block (MHSA + MLP)."""
@@ -79,18 +202,27 @@ class Encoder1DBlock(nn.Module):
     num_heads: int = 12
     dropout: float = 0.0
     dtype_mm: str = "float32"
+    posemb: str | None = None
 
     @nn.compact
-    def __call__(self, x, deterministic=True):  # noqa: FBT002
+    def __call__(self, x, deterministic=True, rope_uv=None):  # noqa: FBT002
         out = {}
         x = sharding.activation_sharding_constraint(x)
         y = nn.LayerNorm(dtype=self.dtype_mm)(x)
-        y = out["sa"] = nn.MultiHeadDotProductAttention(
+        if self.posemb == "rope2d_scale":
+            y = out["sa"] = RotaryMultiHeadDotProductAttention(
+                num_heads=self.num_heads,
+                kernel_init=nn.initializers.xavier_uniform(),
+                dtype=self.dtype_mm,
+            )(y, y, rope_uv)
+        else:
+            y = out["sa"] = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             kernel_init=nn.initializers.xavier_uniform(),
             deterministic=deterministic,
             dtype=self.dtype_mm,
-        )(y, y)
+            )(y, y)
+
         y = sharding.activation_sharding_constraint(y)
         y = nn.Dropout(rate=self.dropout)(y, deterministic)
         x = out["+sa"] = x + y
@@ -118,9 +250,10 @@ class Encoder(nn.Module):
     scan: bool = False
     remat_policy: str = "nothing_saveable"
     dtype_mm: str = "float32"
+    posemb: str | None = None
 
     @nn.compact
-    def __call__(self, x, deterministic=True):  # noqa: FBT002
+    def __call__(self, x, deterministic=True, rope_uv=None):  # noqa: FBT002
         out = {}
 
         if self.scan:
@@ -142,7 +275,8 @@ class Encoder(nn.Module):
                 mlp_dim=self.mlp_dim,
                 num_heads=self.num_heads,
                 dropout=self.dropout,
-            )(x, deterministic)
+                posemb=self.posemb,
+            )(x, deterministic, rope_uv)
             for lyr in range(self.depth):
                 out[f"block{lyr:02d}"] = jax.tree.map(lambda o, lyr=lyr: o[lyr], scan_out)
         else:
@@ -194,8 +328,10 @@ class _Module(nn.Module):
     depth: int = 12
     mlp_dim: int | None = None  # Defaults to 4x input dim
     num_heads: int = 12
-    # posemb: str = "learn"  # Can also be "sincos2d"
-    posemb: str = "sincos2d"  
+    # posemb: str = "learn"  # Can also be "sincos2d" or "rope2d_scale"
+    # posemb: str = "sincos2d"  
+    posemb: str = "rope2d_scale"
+    unify_tiers: bool = False
     rep_size: int | bool = False
     dropout: float = 0.0
     pool_type: str = "gap"  # Can also be "map" or "tok"
@@ -206,7 +342,7 @@ class _Module(nn.Module):
     dtype_mm: str = "float32"
 
     @nn.compact
-    def __call__(self, image, *, train=False):
+    def __call__(self, image, *, train=False, rope_uv=None):
         out = {}
 
         # Kevin edit: do patch extraction and posemb in float32,
@@ -226,8 +362,20 @@ class _Module(nn.Module):
         n, h, w, c = x.shape
         x = jnp.reshape(x, [n, h * w, c])
 
-        # Add posemb before adding extra token.
-        x = out["with_posemb"] = x + get_posemb(self, self.posemb, (h, w), c, "pos_embedding", jnp.float32)
+        if self.posemb == "rope2d_scale":
+            # RoPE replaces additive pos embeddings
+            out["with_posemb"] = x
+        elif self.posemb in ("sincos2d", "learn"):
+            # Add posemb before adding extra token.
+            x = out["with_posemb"] = x + get_posemb(self, self.posemb, (h, w), c, "pos_embedding", jnp.float32)
+        else:
+            raise ValueError(f"Unknown posemb type: {self.posemb}")
+
+        # merge tiers in the batch into one token list
+        if getattr(self, "unify_tiers", False) and self.posemb == "rope2d_scale":
+            # Merge batch into sequence: e.g., B=2, L=64 -> [1, 128, D]
+            x = x.reshape(1, n * h * w, c)
+            n = 1
 
         if self.pool_type == "tok":
             cls = self.param("cls", nn.initializers.zeros, (1, 1, c), x.dtype)
@@ -248,7 +396,7 @@ class _Module(nn.Module):
             remat_policy=self.remat_policy,
             dtype_mm=self.dtype_mm,
             name="Transformer",
-        )(x, deterministic=not train)
+        )(x, deterministic=not train, rope_uv=rope_uv)
         encoded = out["encoded"] = x
 
         if self.pool_type == "map":
