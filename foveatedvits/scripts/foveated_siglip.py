@@ -20,9 +20,9 @@ model = _siglip.Module(
                 pool_type="none",
                 scan=True,
                 dtype_mm='bfloat16',
-                # posemb="rope2d_scale",   # NEW
-                posemb="sincos2d",
-                # unify_tiers=True, # NEW
+                posemb="rope2d_scale",   # NEW
+                # posemb="sincos2d",
+                unify_tiers=True, # NEW
             )
         # )
 
@@ -63,7 +63,7 @@ params = load_siglip_so400m224(params)
 
 @jax.jit
 def forward(p, x, rope_uv=None):                     # compiled once
-    return model.apply({'params': p}, x, train=False) #, rope_uv=rope_uv)
+    return model.apply({'params': p}, x, train=False, rope_uv=rope_uv)
 
 # Load video from path
 # video_path = "/home/justinyu/foveatedvits/foveatedvits/scripts/example_media/right_camera-images-rgb-soup_can_pick.mp4"
@@ -127,7 +127,7 @@ for frame_idx, frame in enumerate(video):
     start_time = time.time()
 
     # u, v = make_uv_for_two_tier_112()  # [1,128] each
-    emb, _ = forward(params, foveated_frames) # out: (2, 64, 1152)
+    emb, _ = forward(params, foveated_frames, rope_uv=(u, v)) # out: (2, 64, 1152)
 
     end_time = time.time()
     if frame_idx > 0:

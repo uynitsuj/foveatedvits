@@ -95,6 +95,41 @@ def rope_apply(q_or_k, u, v, base=10000.0):
     q_rot = jnp.concatenate([qx, qy], axis=-2).reshape(n, L, H, D)
     return q_rot
 
+def rope_cache(u, v, head_dim, base=10000.0):
+    """Precompute 2D RoPE cos/sin for x- and y-axes.
+    u,v: [n,L]; returns cos_x, sin_x, cos_y, sin_y with shape [n,L,P],
+    where P = head_dim//2 per axis (i.e., half the pairs go to x, half to y).
+    """
+    assert head_dim % 2 == 0
+    P = (head_dim // 2) // 2  # number of pairs per axis
+    freqs = jnp.arange(P) / (P - 1 + 1e-9)
+    inv = 1.0 / (base ** freqs)                     # [P]
+    ang_x = jnp.einsum("nl,f->nlf", u, inv)         # [n,L,P]
+    ang_y = jnp.einsum("nl,f->nlf", v, inv)         # [n,L,P]
+    return jnp.cos(ang_x), jnp.sin(ang_x), jnp.cos(ang_y), jnp.sin(ang_y)
+
+
+def rope_apply_cached(q_or_k, cos_x, sin_x, cos_y, sin_y):
+    """Apply cached RoPE phases to q_or_k shaped [n,L,H,D]."""
+    n, L, H, D = q_or_k.shape
+    q = q_or_k.reshape(n, L, H, D // 2, 2)           # [..., pairs, 2]
+    pairs_total = q.shape[-2]
+    pairs_per_axis = pairs_total // 2                # half for x, half for y
+    qx, qy = jnp.split(q, [pairs_per_axis], axis=-2) # each [..., P, 2]
+
+    def rotate(qp, c, s):
+        # qp: [n,L,H,P,2]; c/s: [n,L,P] -> [n,L,1,P] for broadcast
+        c = c[:, :, None, :]
+        s = s[:, :, None, :]
+        x = qp[..., 0]; y = qp[..., 1]
+        xr = x * c - y * s
+        yr = x * s + y * c
+        return jnp.stack([xr, yr], axis=-1)
+
+    qx = rotate(qx, cos_x, sin_x)
+    qy = rotate(qy, cos_y, sin_y)
+    return jnp.concatenate([qx, qy], axis=-2).reshape(n, L, H, D)
+
 
 def posemb_sincos_2d(h, w, width, temperature=10_000.0, dtype=jnp.float32):
     """Follows the MoCo v3 logic."""
@@ -150,41 +185,42 @@ class RotaryMultiHeadDotProductAttention(nn.Module):
     deterministic: bool = True
 
     @nn.compact
-    def __call__(self, inputs_q, inputs_kv, rope_uv=None):
-        # inputs_*: [n,L,d_model]
+    def __call__(self, inputs_q, inputs_kv, rope_uv=None, rope_cache=None,):
         d_model = inputs_q.shape[-1]
         head_dim = d_model // self.num_heads
         assert (d_model % self.num_heads) == 0, "d_model must be divisible by num_heads."
-        dense = lambda: nn.DenseGeneral(  # noqa: E731
+
+        proj = lambda: nn.DenseGeneral(  # noqa: E731
             features=(self.num_heads, head_dim),
             axis=-1,
             dtype=self.dtype,
             kernel_init=self.kernel_init,
             bias_init=nn.initializers.zeros,
         )
-        q = dense()(inputs_q)   # [n,L,H,Dh]
-        k = dense()(inputs_kv)  # [n,L,H,Dh]
-        v = dense()(inputs_kv)  # [n,L,H,Dh]
+        q = proj()(inputs_q)   # [n,L,H,Dh]
+        k = proj()(inputs_kv)  # [n,L,H,Dh]
+        v = proj()(inputs_kv)  # [n,L,H,Dh]
 
-        # RoPE: u,v are [n,L]; if None, build a regular grid
-        if rope_uv is None:
-            n, L = q.shape[0], q.shape[1]
-            # default grid in [0,1): approximate u=x/s, v=y/s with s ~ patch size -> use normalized (x,y)
-            # Build an 1D index and pretend it came from an h×w grid
-            h = w = int(jnp.sqrt(L))
-            assert h * w == L, "Provide rope_uv for non-square / multi-tier sequences."
-            ys, xs = jnp.mgrid[:h, :w]
-            xs = (xs.reshape(-1) + 0.5) / w
-            ys = (ys.reshape(-1) + 0.5) / h
-            u = jnp.tile(xs[None, :], [n, 1])
-            v = jnp.tile(ys[None, :], [n, 1])
+        if rope_cache is None:
+            # Build a default (u,v) only for simple square single-tier; otherwise require rope_cache
+            if rope_uv is None:
+                n, L = q.shape[0], q.shape[1]
+                h = w = int(jnp.sqrt(L))
+                assert h * w == L, "Provide rope_cache for non-square / multi-tier sequences."
+                ys, xs = jnp.mgrid[:h, :w]
+                xs = (xs.reshape(-1) + 0.5) / w
+                ys = (ys.reshape(-1) + 0.5) / h
+                u = jnp.tile(xs[None, :], [n, 1])
+                v = jnp.tile(ys[None, :], [n, 1])
+            else:
+                u, v = rope_uv
+            cos_x, sin_x, cos_y, sin_y = rope_cache(u, v, head_dim)  # fallback compute
         else:
-            u, v = rope_uv  # each [n,L]
+            cos_x, sin_x, cos_y, sin_y = rope_cache
 
-        q = rope_apply(q, u, v)
-        k = rope_apply(k, u, v)
+        q = rope_apply_cached(q, cos_x, sin_x, cos_y, sin_y)
+        k = rope_apply_cached(k, cos_x, sin_x, cos_y, sin_y)
 
-        # scaled dot-product attn
         scale = 1.0 / jnp.sqrt(head_dim).astype(q.dtype)
         attn_logits = jnp.einsum("nqhd,nkhd->nhqk", q, k) * scale
         attn = nn.softmax(attn_logits, axis=-1)
@@ -193,6 +229,7 @@ class RotaryMultiHeadDotProductAttention(nn.Module):
             features=d_model, axis=(-2, -1), dtype=self.dtype, kernel_init=self.kernel_init
         )(out)
         return out
+
 
 
 class Encoder1DBlock(nn.Module):
@@ -205,7 +242,7 @@ class Encoder1DBlock(nn.Module):
     posemb: str | None = None
 
     @nn.compact
-    def __call__(self, x, deterministic=True, rope_uv=None):  # noqa: FBT002
+    def __call__(self, x, deterministic=True, rope_uv=None, rope_cache=None):  # noqa: FBT002
         out = {}
         x = sharding.activation_sharding_constraint(x)
         y = nn.LayerNorm(dtype=self.dtype_mm)(x)
@@ -214,7 +251,7 @@ class Encoder1DBlock(nn.Module):
                 num_heads=self.num_heads,
                 kernel_init=nn.initializers.xavier_uniform(),
                 dtype=self.dtype_mm,
-            )(y, y, rope_uv)
+            )(y, y, rope_uv=rope_uv, rope_cache=rope_cache)
         else:
             y = out["sa"] = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
@@ -253,7 +290,7 @@ class Encoder(nn.Module):
     posemb: str | None = None
 
     @nn.compact
-    def __call__(self, x, deterministic=True, rope_uv=None):  # noqa: FBT002
+    def __call__(self, x, deterministic=True, rope_uv=None, rope_cache=None):  # noqa: FBT002
         out = {}
 
         if self.scan:
@@ -276,7 +313,7 @@ class Encoder(nn.Module):
                 num_heads=self.num_heads,
                 dropout=self.dropout,
                 posemb=self.posemb,
-            )(x, deterministic, rope_uv)
+            )(x, deterministic, rope_uv=rope_uv, rope_cache=rope_cache)
             for lyr in range(self.depth):
                 out[f"block{lyr:02d}"] = jax.tree.map(lambda o, lyr=lyr: o[lyr], scan_out)
         else:
@@ -289,7 +326,7 @@ class Encoder(nn.Module):
                     num_heads=self.num_heads,
                     dropout=self.dropout,
                 )
-                x, out[f"block{lyr:02d}"] = block_cur(x, deterministic)
+                x, out[f"block{lyr:02d}"] = block_cur(x, deterministic, rope_uv=rope_uv, rope_cache=rope_cache)
             out["pre_ln"] = x  # Alias for last block, but without the number in it.
 
         return nn.LayerNorm(name="encoder_norm", dtype=self.dtype_mm)(x), out
@@ -387,6 +424,18 @@ class _Module(nn.Module):
         # Kevin edit: now cast back to dtype_mm (potentially half precision)
         x = x.astype(self.dtype_mm)
 
+        rope_cache_vals = None
+        if self.posemb == "rope2d_scale":
+            # Expect rope_uv=(u,v) with shapes [n,L]; after unify_tiers, n=1, L=128
+            assert rope_uv is not None, "rope_uv (u,v) required for rope2d_scale."
+            u, v = rope_uv
+            head_dim = self.width // self.num_heads
+            cos_x, sin_x, cos_y, sin_y = rope_cache(u, v, head_dim)
+            # Cast to compute dtype to avoid dtype churn later
+            cos_x = cos_x.astype(self.dtype_mm); sin_x = sin_x.astype(self.dtype_mm)
+            cos_y = cos_y.astype(self.dtype_mm); sin_y = sin_y.astype(self.dtype_mm)
+            rope_cache_vals = (cos_x, sin_x, cos_y, sin_y)
+
         x, out["encoder"] = Encoder(
             depth=self.depth,
             mlp_dim=self.mlp_dim,
@@ -396,7 +445,7 @@ class _Module(nn.Module):
             remat_policy=self.remat_policy,
             dtype_mm=self.dtype_mm,
             name="Transformer",
-        )(x, deterministic=not train, rope_uv=rope_uv)
+        )(x, deterministic=not train, rope_uv=rope_uv, rope_cache=rope_cache_vals)
         encoded = out["encoded"] = x
 
         if self.pool_type == "map":
